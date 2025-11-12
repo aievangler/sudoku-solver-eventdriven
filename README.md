@@ -1,7 +1,3 @@
-<<<<<<< HEAD
-# sudoku-solver-eventdriven
-Initial commit: 81-bit event-driven solver
-=======
 # Event-Driven Sudoku Solver with Additive I_Cell Logic
 
 A high-performance Sudoku solver based on **additive bitboard propagation** and **event-driven constraint analysis**. Achieving **2.05 ms median on hard95** and **8.77 ms mean on forum_hardest_48766** in pure Python.
