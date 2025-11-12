@@ -18,11 +18,12 @@ The result: **Order-of-magnitude speedups** while maintaining clarity and simpli
 
 ## 📊 Performance
 
-| Benchmark | Median | Mean | Notes |
-|-----------|--------|------|-------|
-| **hard95** | 2.05 ms | ~2.1 ms | Standard 95 hardest puzzles |
-| **17-clue (easiest)** | 0.16 ms | ~0.18 ms | Low-clue puzzles |
-| **forum_hardest_48766** | 7.09 ms | 8.77 ms | 48,766 puzzles (11+ Explainer rating) |
+| Benchmark Set       | Puzzles | Median  | Mean    | Min     | Max       | Notes |
+| ------------------- | ------- | ------- | ------- | ------- | --------- |-------|
+| hard95              | 95      | 2.09 ms | 3.69 ms | 0.18 ms | 19.63 ms  |Standard 95 hardest puzzles |
+| 17-clue             | 49,158  | 0.16 ms | 1.01 ms | 5 µs    | 260.69 ms |Low-clue puzzles |
+| forum_hardest_48766 | 48,766  | 7.09 ms | 8.77 ms | 0.19 ms | 107.45 ms |48,766 puzzles (11+ Explainer rating) |
+
 
 **Pure Python baseline.** C++ port expected to achieve **2-8x speedup** with cache optimization and SIMD vectorization.
 
