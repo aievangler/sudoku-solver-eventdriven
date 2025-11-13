@@ -48,7 +48,7 @@ Every placement **forbids** a set of cells (same row, column, 3×3 box). Instead
 
 ### Visual Example
 
-![Additive I_Cell with Overlap]([icache_9x9_additive_overlap-1.jpg](https://github.com/aievangler/sudoku-solver-eventdriven/blob/main/images/icache_9x9_contradiction_cell.png))
+![Additive I_Cell with Overlap](https://github.com/aievangler/sudoku-solver-eventdriven/blob/main/images/icache_9x9_contradiction_cell.png)
 
 **What the visualization shows:**
 
