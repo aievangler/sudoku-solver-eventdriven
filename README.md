@@ -64,7 +64,8 @@ Every placement **forbids** a set of cells (same row, column, 3×3 box). Instead
 
 When two placements together **eliminate all candidates from a cell**, the solver detects contradiction **without propagation**:
 
-![Additive Contradiction Detection](icache_9x9_contradiction_cell.jpg)
+![Additive I_Cell with Overlap](https://raw.githubusercontent.com/aievangler/sudoku-solver-eventdriven/main/images/icache_9x9_additive_overlap_fixed.png)
+
 
 **What happens:**
 
