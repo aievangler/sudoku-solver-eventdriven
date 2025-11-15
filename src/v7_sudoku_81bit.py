@@ -205,9 +205,16 @@ class SolverState:
         "overlay_calls",
         "overlay_rejects",
         "overlay_disabled",
+        "hp_queue",
+        "hp_pending",
+        "profile_core",
+        "time_prop",
+        "time_score",
+        "_prop_depth",
+        "_prop_start",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, profile_core: bool = False) -> None:
         self.B: List[int] = [ALL_BITS for _ in DIGITS]
         self.cell_deg: List[int] = [9 for _ in CELLS]
         self.unit_digit_deg: List[List[int]] = [[9 for _ in DIGITS] for _ in range(27)]
@@ -220,6 +227,13 @@ class SolverState:
         self.overlay_calls: int = 0
         self.overlay_rejects: int = 0
         self.overlay_disabled: bool = False
+        self.hp_queue: deque[int] = deque()
+        self.hp_pending: set[int] = set()
+        self.profile_core: bool = profile_core
+        self.time_prop: float = 0.0
+        self.time_score: float = 0.0
+        self._prop_depth: int = 0
+        self._prop_start: float = 0.0
 
     # ------------------------------------------------------------------
     # Core helpers
@@ -233,6 +247,26 @@ class SolverState:
     def reset_touched_units(self) -> None:
         self.touched_units_since_branch.clear()
 
+    def _prop_timer_start(self) -> None:
+        if not self.profile_core:
+            return
+        if self._prop_depth == 0:
+            self._prop_start = perf_counter()
+        self._prop_depth += 1
+
+    def _prop_timer_end(self) -> None:
+        if not self.profile_core:
+            return
+        self._prop_depth -= 1
+        if self._prop_depth == 0:
+            self.time_prop += perf_counter() - self._prop_start
+
+    def _enqueue_hidden_pair_unit(self, unit: int) -> None:
+        if unit in self.hp_pending:
+            return
+        self.hp_pending.add(unit)
+        self.hp_queue.append(unit)
+
     def _apply_clear(
         self,
         d: int,
@@ -241,32 +275,43 @@ class SolverState:
         mark: int,
         update_board: bool,
     ) -> bool:
-        trail = self.trail
-        if update_board:
-            self.B[d] &= ~bit_flag
-        trail.append(("CLR", c, d))
-        cell_deg = self.cell_deg
-        cell_deg[c] -= 1
-        if cell_deg[c] < 0:
-            self.undo_to(mark)
-            return False
-        value = self.value
-        if value[c] == -1 and cell_deg[c] == 1:
-            self.Qcell.append(c)
-        touched_units = self.touched_units_since_branch
-        unit_digit_deg = self.unit_digit_deg
-        for unit in CELL_UNITS[c]:
-            unit_digit_deg[unit][d] -= 1
-            if unit_digit_deg[unit][d] < 0:
+        timed = self.profile_core
+        if timed:
+            self._prop_timer_start()
+        try:
+            trail = self.trail
+            if update_board:
+                self.B[d] &= ~bit_flag
+            trail.append(("CLR", c, d))
+            cell_deg = self.cell_deg
+            cell_deg[c] -= 1
+            if cell_deg[c] < 0:
                 self.undo_to(mark)
                 return False
-            if unit_digit_deg[unit][d] == 1:
-                self.Qunit.append((unit, d))
-            touched_units.add(unit)
-        if cell_deg[c] == 0 and value[c] == -1:
-            self.undo_to(mark)
-            return False
-        return True
+            value = self.value
+            if value[c] == -1 and cell_deg[c] == 1:
+                self.Qcell.append(c)
+            touched_units = self.touched_units_since_branch
+            unit_digit_deg = self.unit_digit_deg
+            for unit in CELL_UNITS[c]:
+                old = unit_digit_deg[unit][d]
+                new = old - 1
+                unit_digit_deg[unit][d] = new
+                if new < 0:
+                    self.undo_to(mark)
+                    return False
+                if new == 1:
+                    self.Qunit.append((unit, d))
+                if old != 2 and new == 2:
+                    self._enqueue_hidden_pair_unit(unit)
+                touched_units.add(unit)
+            if cell_deg[c] == 0 and value[c] == -1:
+                self.undo_to(mark)
+                return False
+            return True
+        finally:
+            if timed:
+                self._prop_timer_end()
 
     def clear_bit(self, d: int, c: int) -> bool:
         B = self.B
@@ -280,62 +325,89 @@ class SolverState:
         return self._apply_clear(d, c, bit_flag, mark, update_board=True)
 
     def place(self, c: int, d: int) -> bool:
-        B = self.B
-        bit = BIT[c]
-        value = self.value
-        if not (B[d] & bit):
-            return False
-        mark = len(self.trail)
-        for e in DIGITS:
-            if e != d and (B[e] & bit):
-                if not self.clear_bit(e, c):
+        timed = self.profile_core
+        if timed:
+            self._prop_timer_start()
+        try:
+            B = self.B
+            bit = BIT[c]
+            value = self.value
+            if not (B[d] & bit):
+                return False
+            mark = len(self.trail)
+            for e in DIGITS:
+                if e != d and (B[e] & bit):
+                    if not self.clear_bit(e, c):
+                        return False
+            if value[c] == -1:
+                value[c] = d
+                self.placed_count += 1
+                self.trail.append(("VAL", c, None))
+            peer_mask = B[d] & PEER_MASKS[c]
+            diff = peer_mask
+            while diff:
+                bit_flag = diff & -diff
+                diff ^= bit_flag
+                t = _lsb_index(bit_flag)
+                if value[t] == d:
+                    self.undo_to(mark)
                     return False
-        if value[c] == -1:
-            value[c] = d
-            self.placed_count += 1
-            self.trail.append(("VAL", c, None))
-        peer_mask = B[d] & PEER_MASKS[c]
-        diff = peer_mask
-        while diff:
-            bit_flag = diff & -diff
-            diff ^= bit_flag
-            t = _lsb_index(bit_flag)
-            if value[t] == d:
-                self.undo_to(mark)
-                return False
-            if not self._apply_clear(d, t, bit_flag, mark, update_board=True):
-                return False
-        return True
+                if not self._apply_clear(d, t, bit_flag, mark, update_board=True):
+                    return False
+            return True
+        finally:
+            if timed:
+                self._prop_timer_end()
 
     def drain_events(self) -> bool:
-        Qcell = self.Qcell
-        Qunit = self.Qunit
-        value = self.value
-        cell_deg = self.cell_deg
-        unit_digit_deg = self.unit_digit_deg
-        B = self.B
-        while Qcell or Qunit:
-            while Qcell:
-                c = Qcell.popleft()
-                if value[c] != -1 or cell_deg[c] != 1:
-                    continue
-                digit = self._single_digit(c)
-                if digit is None:
-                    return False
-                if not self.place(c, digit):
-                    return False
-            while not Qcell and Qunit:
-                unit, digit = Qunit.popleft()
-                if unit_digit_deg[unit][digit] != 1:
-                    continue
-                mask = B[digit] & UNIT_MASKS[unit]
-                if mask == 0:
-                    return False
-                c = _lsb_index(mask)
-                if value[c] == -1:
+        timed = self.profile_core
+        if timed:
+            self._prop_timer_start()
+        try:
+            Qcell = self.Qcell
+            Qunit = self.Qunit
+            value = self.value
+            cell_deg = self.cell_deg
+            unit_digit_deg = self.unit_digit_deg
+            B = self.B
+            while True:
+                progressed = False
+                while Qcell:
+                    progressed = True
+                    c = Qcell.popleft()
+                    if value[c] != -1 or cell_deg[c] != 1:
+                        continue
+                    digit = self._single_digit(c)
+                    if digit is None:
+                        return False
                     if not self.place(c, digit):
                         return False
-        return True
+                while not Qcell and Qunit:
+                    progressed = True
+                    unit, digit = Qunit.popleft()
+                    if unit_digit_deg[unit][digit] != 1:
+                        continue
+                    mask = B[digit] & UNIT_MASKS[unit]
+                    if mask == 0:
+                        return False
+                    c = _lsb_index(mask)
+                    if value[c] == -1:
+                        if not self.place(c, digit):
+                            return False
+                if Qcell or Qunit:
+                    continue
+                if self.hp_queue:
+                    progressed = True
+                    unit = self.hp_queue.popleft()
+                    self.hp_pending.discard(unit)
+                    if not self._hidden_pairs_in_unit(unit):
+                        return False
+                    continue
+                if not progressed:
+                    return True
+        finally:
+            if timed:
+                self._prop_timer_end()
 
     def _single_digit(self, c: int) -> Optional[int]:
         bit = BIT[c]
@@ -344,6 +416,42 @@ class SolverState:
             if B[d] & bit:
                 return d
         return None
+
+    def _hidden_pairs_in_unit(self, unit: int) -> bool:
+        unit_mask = UNIT_MASKS[unit]
+        unit_degs = self.unit_digit_deg[unit]
+        mask_to_digits: Dict[int, List[int]] = {}
+        B = self.B
+        for d in DIGITS:
+            if unit_degs[d] == 2:
+                mask = B[d] & unit_mask
+                if bitcount(mask) == 2:
+                    mask_to_digits.setdefault(mask, []).append(d)
+        if not mask_to_digits:
+            return True
+        for mask, digits in mask_to_digits.items():
+            if len(digits) != 2:
+                continue
+            allowed = set(digits)
+            cells: List[int] = []
+            temp = mask
+            while temp:
+                bit_flag = temp & -temp
+                temp ^= bit_flag
+                cells.append(_lsb_index(bit_flag))
+            if len(cells) != 2:
+                continue
+            for c in cells:
+                if self.value[c] != -1:
+                    continue
+                bit = BIT[c]
+                for d in DIGITS:
+                    if d in allowed:
+                        continue
+                    if B[d] & bit:
+                        if not self.clear_bit(d, c):
+                            return False
+        return True
 
     def undo_to(self, mark: int) -> None:
         while len(self.trail) > mark:
@@ -363,6 +471,8 @@ class SolverState:
                 self.placed_count -= 1
         self.Qcell.clear()
         self.Qunit.clear()
+        self.hp_queue.clear()
+        self.hp_pending.clear()
 
     # ------------------------------------------------------------------
     # Heuristics
@@ -571,9 +681,12 @@ class SolverState:
 # ---------------------------------------------------------------------------
 
 class Bit81Solver:
-    def __init__(self, puzzle: str) -> None:
-        self.state = SolverState()
+    def __init__(self, puzzle: str, profile_core: bool = False, timeout_sec: Optional[float] = None) -> None:
+        self.state = SolverState(profile_core=profile_core)
         self.stats = SolverStats()
+        self.profile_core = profile_core
+        self.deadline: Optional[float] = (perf_counter() + timeout_sec) if timeout_sec else None
+        self.timed_out: bool = False
         for idx, ch in enumerate(puzzle):
             if ch in ".0":
                 continue
@@ -587,6 +700,8 @@ class Bit81Solver:
 
     def solve(self) -> Optional[str]:
         if not self._dfs():
+            if self.deadline and perf_counter() > self.deadline:
+                self.timed_out = True
             return None
         digits = []
         for c in CELLS:
@@ -597,12 +712,20 @@ class Bit81Solver:
         return "".join(digits)
 
     def _dfs(self) -> bool:
+        if self.deadline is not None and perf_counter() > self.deadline:
+            self.timed_out = True
+            return False
         state = self.state
         if not state.drain_events():
             return False
         if state.placed_count == 81:
             return True
-        choice = state.choose_next()
+        if state.profile_core:
+            score_start = perf_counter()
+            choice = state.choose_next()
+            state.time_score += perf_counter() - score_start
+        else:
+            choice = state.choose_next()
         if choice is None:
             return False
         cell, candidates = choice
@@ -645,6 +768,9 @@ class Bit81Solver:
             state.reset_touched_units()
 
         for d in branch_digits:
+            if self.deadline is not None and perf_counter() > self.deadline:
+                self.timed_out = True
+                return False
             state.reset_touched_units()
             mark = len(state.trail)
             self.stats.nodes += 1
@@ -669,11 +795,11 @@ def _solve_single_attempt(puzzle: str, args: argparse.Namespace) -> Dict[str, An
     verified = False
     for _ in range(args.runs):
         try:
-            solver = Bit81Solver(puzzle)
+            solver = Bit81Solver(puzzle, profile_core=args.profile_core, timeout_sec=args.timeout_sec)
         except ValueError as exc:
             return {
                 "time_ms": None,
-                "stats": {"nodes": 0, "placements": 0},
+                "stats": {"nodes": 0, "placements": 0, "prop_ms": 0.0, "score_ms": 0.0, "dfs_ms": 0.0},
                 "solution": None,
                 "verified": False,
                 "status": "ERROR",
@@ -682,11 +808,18 @@ def _solve_single_attempt(puzzle: str, args: argparse.Namespace) -> Dict[str, An
         start = perf_counter()
         solution = solver.solve()
         elapsed_ms = (perf_counter() - start) * 1000.0
+        prop_ms = solver.state.time_prop * 1000.0
+        score_ms = solver.state.time_score * 1000.0
+        dfs_ms = max((elapsed_ms or 0.0) - prop_ms - score_ms, 0.0) if elapsed_ms is not None else 0.0
         stats_snapshot = {
             "nodes": solver.stats.nodes,
             "placements": solver.stats.placements,
+            "prop_ms": prop_ms,
+            "score_ms": score_ms,
+            "dfs_ms": dfs_ms,
         }
-        if solution is not None:
+        timed_out = solver.timed_out
+        if solution is not None and not timed_out:
             if best_time is None or elapsed_ms < best_time:
                 best_time = elapsed_ms
                 best_solution = solution
@@ -698,11 +831,15 @@ def _solve_single_attempt(puzzle: str, args: argparse.Namespace) -> Dict[str, An
         else:
             if best_stats is None:
                 best_stats = stats_snapshot
-            status = "FAIL"
-            error_msg = "contradiction"
+            if timed_out:
+                status = "TIMEOUT"
+                error_msg = "time limit exceeded"
+            else:
+                status = "FAIL"
+                error_msg = "contradiction"
     return {
         "time_ms": best_time,
-        "stats": best_stats or {"nodes": 0, "placements": 0},
+        "stats": best_stats or {"nodes": 0, "placements": 0, "prop_ms": 0.0, "score_ms": 0.0, "dfs_ms": 0.0},
         "solution": best_solution,
         "verified": verified,
         "status": status,
@@ -720,6 +857,19 @@ def _print_single_result(idx: int, result: Dict[str, Any]) -> None:
     print(f"  Stats    : nodes={stats.get('nodes', '—')} placements={stats.get('placements', '—')}")
     if result["time_ms"] is not None:
         print(f"  Time     : {result['time_ms']:.2f} ms ({format_us(result['time_ms'])})")
+        prop_ms = stats.get("prop_ms")
+        score_ms = stats.get("score_ms")
+        dfs_ms = stats.get("dfs_ms")
+        if prop_ms is not None and score_ms is not None and dfs_ms is not None:
+            total = result["time_ms"] or 0.0
+            def pct(val: float) -> float:
+                return (val / total * 100.0) if total else 0.0
+            print(
+                "  Core     : "
+                f"prop={prop_ms:.2f} ms ({pct(prop_ms):.1f}%) "
+                f"score={score_ms:.2f} ms ({pct(score_ms):.1f}%) "
+                f"dfs={dfs_ms:.2f} ms ({pct(dfs_ms):.1f}%)"
+            )
 
 
 def _aggregate_puzzle_runs(
@@ -734,8 +884,14 @@ def _aggregate_puzzle_runs(
     mean_ms = (sum(solved_times) / len(solved_times)) if solved_times else 0.0
     nodes_values = [r["stats"]["nodes"] for r in runs if r["stats"]]
     placements_values = [r["stats"]["placements"] for r in runs if r["stats"]]
+    prop_values = [r["stats"].get("prop_ms", 0.0) for r in runs if r["stats"]]
+    score_values = [r["stats"].get("score_ms", 0.0) for r in runs if r["stats"]]
+    dfs_values = [r["stats"].get("dfs_ms", 0.0) for r in runs if r["stats"]]
     nodes_mean = (sum(nodes_values) / len(nodes_values)) if nodes_values else 0.0
     placements_mean = (sum(placements_values) / len(placements_values)) if placements_values else 0.0
+    prop_mean = (sum(prop_values) / len(prop_values)) if prop_values else 0.0
+    score_mean = (sum(score_values) / len(score_values)) if score_values else 0.0
+    dfs_mean = (sum(dfs_values) / len(dfs_values)) if dfs_values else 0.0
     if solved_runs == rep_count and rep_count > 0:
         status = "OK"
         error_msg = None
@@ -759,7 +915,13 @@ def _aggregate_puzzle_runs(
         "max_ms": max_ms,
         "rep_count": rep_count,
         "solved_runs": solved_runs,
-        "stats": {"nodes": nodes_mean, "placements": placements_mean},
+        "stats": {
+            "nodes": nodes_mean,
+            "placements": placements_mean,
+            "prop_ms": prop_mean,
+            "score_ms": score_mean,
+            "dfs_ms": dfs_mean,
+        },
         "verified": verified_any,
     }
 
@@ -777,6 +939,9 @@ def _export_results_csv(path: Path, run_records: List[Dict[str, Any]]) -> None:
         "rep_count",
         "nodes_mean",
         "placements_mean",
+        "prop_ms",
+        "score_ms",
+        "dfs_ms",
         "solution",
         "error",
     ]
@@ -795,6 +960,9 @@ def _export_results_csv(path: Path, run_records: List[Dict[str, Any]]) -> None:
             str(record.get("rep_count", 1)),
             f"{stats.get('nodes', 0.0):.6f}",
             f"{stats.get('placements', 0.0):.6f}",
+            f"{stats.get('prop_ms', 0.0):.6f}",
+            f"{stats.get('score_ms', 0.0):.6f}",
+            f"{stats.get('dfs_ms', 0.0):.6f}",
             record.get("solution") or "",
             record.get("error") or "",
         ]
@@ -849,6 +1017,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--quiet",
         action="store_true",
         help="Suppress per-puzzle console output.",
+    )
+    parser.add_argument(
+        "--profile-core",
+        action="store_true",
+        help="Measure propagation/scoring/DFS timings (per puzzle).",
+    )
+    parser.add_argument(
+        "--timeout-sec",
+        type=float,
+        default=None,
+        help="Per-puzzle timeout in seconds (optional).",
     )
     parser.add_argument(
         "--html-output",
@@ -968,6 +1147,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         verified_run_count = sum(1 for rec in run_records if rec.get("verified"))
         verified_pct = (verified_run_count / len(run_records) * 100.0) if run_records else 0.0
         print(f"Verified {verified_run_count}/{len(run_records)} puzzle(s) ({verified_pct:.1f}%).")
+        if args.profile_core:
+            prop_total = sum(rec.get("stats", {}).get("prop_ms", 0.0) for rec in run_records)
+            score_total = sum(rec.get("stats", {}).get("score_ms", 0.0) for rec in run_records)
+            dfs_total = sum(rec.get("stats", {}).get("dfs_ms", 0.0) for rec in run_records)
+            total_ms = sum(rec.get("time_ms", 0.0) for rec in run_records)
+            def pct(val: float) -> float:
+                return (val / total_ms * 100.0) if total_ms else 0.0
+            print(
+                "Core breakdown (totals): "
+                f"prop {prop_total:.2f} ms ({pct(prop_total):.1f}%) | "
+                f"score {score_total:.2f} ms ({pct(score_total):.1f}%) | "
+                f"dfs {dfs_total:.2f} ms ({pct(dfs_total):.1f}%)"
+            )
     else:
         solved_count = verified_run_count = 0
 

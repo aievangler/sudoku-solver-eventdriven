@@ -253,6 +253,7 @@ def generate_html_report(
     command_line: str,
     format_us_func,
     db_run_id: Optional[int] = None,
+    total_time_ms: Optional[float] = None,
 ) -> Path:
     output_path = Path(output_path)
     is_directory = output_path.suffix.lower() != ".html"
@@ -281,6 +282,9 @@ def generate_html_report(
         "percent_solved": (solved / total * 100.0) if total else 0.0,
         "verified": verified_total,
     }
+    if total_time_ms is not None:
+        summary["total_runtime_ms"] = total_time_ms
+        summary["total_runtime_s"] = total_time_ms / 1000.0
     if times:
         sorted_times = sorted(times)
         summary.update(
@@ -302,32 +306,69 @@ def generate_html_report(
     }
 
     format_us = format_us_func
-    table_rows = [
-        "<tr>"
-        "<th>#</th><th>Status</th><th>Mean (ms)</th><th>Median (ms)</th><th>Min (ms)</th><th>Max (ms)</th>"
-        "<th>Nodes</th><th>Placements</th><th>Runs</th><th>Error</th><th>Input Puzzle</th><th>Solution</th>"
-        "</tr>"
+    has_core_breakdown = any(
+        isinstance(record.get("stats"), dict)
+        and any(key in record["stats"] for key in ("prop_ms", "score_ms", "dfs_ms"))
+        for record in run_records
+    )
+    header_cols = [
+        "<th>#</th>",
+        "<th>Status</th>",
+        "<th>Mean (ms)</th>",
+        "<th>Median (ms)</th>",
+        "<th>Min (ms)</th>",
+        "<th>Max (ms)</th>",
+        "<th>Nodes</th>",
+        "<th>Placements</th>",
+        "<th>Runs</th>",
     ]
+    if has_core_breakdown:
+        header_cols.extend(
+            [
+                "<th>Prop (ms)</th>",
+                "<th>Score (ms)</th>",
+                "<th>DFS (ms)</th>",
+            ]
+        )
+    header_cols.extend(
+        [
+            "<th>Error</th>",
+            "<th>Input Puzzle</th>",
+            "<th>Solution</th>",
+        ]
+    )
+    table_rows = ["<tr>" + "".join(header_cols) + "</tr>"]
     for record in run_records:
         stats = record.get("stats") or {}
         failed = record.get("status") != "OK"
         row_class = " class='fail-row'" if failed else ""
-        table_rows.append(
-            f"<tr{row_class}>"
-            f"<td>{record['index']}</td>"
-            f"<td>{html.escape(record['status'])}</td>"
-            f"<td>{_format_ms(record.get('time_ms'))}</td>"
-            f"<td>{_format_ms(record.get('median_ms'))}</td>"
-            f"<td>{_format_ms(record.get('min_ms'))}</td>"
-            f"<td>{_format_ms(record.get('max_ms'))}</td>"
-            f"<td>{stats.get('nodes', '—')}</td>"
-            f"<td>{stats.get('placements', '—')}</td>"
-            f"<td>{record.get('solved_runs', '—')}/{record.get('rep_count', '—')}</td>"
-            f"<td>{html.escape(record.get('error') or '—')}</td>"
-            f"<td><code>{html.escape(record['puzzle'])}</code></td>"
-            f"<td><code>{html.escape(record.get('solution') or '—')}</code></td>"
-            "</tr>"
+        row_cells = [
+            f"<td>{record['index']}</td>",
+            f"<td>{html.escape(record['status'])}</td>",
+            f"<td>{_format_ms(record.get('time_ms'))}</td>",
+            f"<td>{_format_ms(record.get('median_ms'))}</td>",
+            f"<td>{_format_ms(record.get('min_ms'))}</td>",
+            f"<td>{_format_ms(record.get('max_ms'))}</td>",
+            f"<td>{stats.get('nodes', '—')}</td>",
+            f"<td>{stats.get('placements', '—')}</td>",
+            f"<td>{record.get('solved_runs', '—')}/{record.get('rep_count', '—')}</td>",
+        ]
+        if has_core_breakdown:
+            row_cells.extend(
+                [
+                    f"<td>{_format_ms(stats.get('prop_ms'))}</td>",
+                    f"<td>{_format_ms(stats.get('score_ms'))}</td>",
+                    f"<td>{_format_ms(stats.get('dfs_ms'))}</td>",
+                ]
+            )
+        row_cells.extend(
+            [
+                f"<td>{html.escape(record.get('error') or '—')}</td>",
+                f"<td><code>{html.escape(record['puzzle'])}</code></td>",
+                f"<td><code>{html.escape(record.get('solution') or '—')}</code></td>",
+            ]
         )
+        table_rows.append(f"<tr{row_class}>" + "".join(row_cells) + "</tr>")
 
     run_failed = solved != total
     db_list_item = f"<li><strong>Database Run ID:</strong> {db_run_id}</li>" if db_run_id else ""
@@ -387,6 +428,7 @@ def generate_html_report(
       <li><strong>P95:</strong> {_format_ms(summary.get("p95"))} ({format_us(summary.get("p95"))})</li>
       <li><strong>P99:</strong> {_format_ms(summary.get("p99"))} ({format_us(summary.get("p99"))})</li>
       <li><strong>Max:</strong> {_format_ms(summary.get("max"))} ({format_us(summary.get("max"))})</li>
+      {f"<li><strong>Total Runtime:</strong> {summary.get('total_runtime_s', 0.0):.2f} s</li>" if summary.get("total_runtime_s") is not None else ""}
     </ul>
   </section>
   <section>
@@ -415,6 +457,7 @@ def generate_html_report(
         "run_records": run_records,
         "generated_at": timestamp,
         "db_run_id": db_run_id,
+        "total_time_ms": total_time_ms,
     }
     _write_detail_json(detail_path, report_payload)
 
@@ -439,6 +482,7 @@ def generate_html_report(
         "start": args.start,
         "runs": args.runs,
         "db_run_id": db_run_id,
+        "total_time_ms": total_time_ms,
     }
     runs = [entry] + existing_runs
     runs = runs[:200]
