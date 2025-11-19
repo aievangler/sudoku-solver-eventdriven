@@ -1,0 +1,2 @@
+/usr/bin/ar qc libcppsolver_lib.a CMakeFiles/cppsolver_lib.dir/src/geometry.cpp.o CMakeFiles/cppsolver_lib.dir/src/state.cpp.o CMakeFiles/cppsolver_lib.dir/src/trail.cpp.o CMakeFiles/cppsolver_lib.dir/src/propagation.cpp.o CMakeFiles/cppsolver_lib.dir/src/scoring.cpp.o CMakeFiles/cppsolver_lib.dir/src/dfs.cpp.o CMakeFiles/cppsolver_lib.dir/src/solver.cpp.o
+/usr/bin/ranlib libcppsolver_lib.a
