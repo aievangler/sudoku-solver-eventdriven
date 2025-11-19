@@ -64,6 +64,12 @@ def format_us(value: Any) -> str:
     return f"{value * 1000:.0f} \u00B5s" if isinstance(value, (int, float)) else "n/a"
 
 
+def _with_run_id(path: Path, run_id: int) -> Path:
+    stem = path.stem
+    suffix = path.suffix
+    return path.with_name(f"{stem}_run_{run_id}{suffix}")
+
+
 ROWS: List[List[int]] = [[9 * r + c for c in range(9)] for r in range(9)]
 COLS: List[List[int]] = [[9 * r + c for r in range(9)] for c in range(9)]
 BOXES: List[List[int]] = []
@@ -478,9 +484,12 @@ class SolverState:
     # Heuristics
     # ------------------------------------------------------------------
     def score_impact(self, c: int, d: int) -> int:
-        return (self.cell_deg[c] - 1) + bitcount(self.B[d] & PEER_MASKS[c])
+        local_tightness = max(0, 9 - self.cell_deg[c])
+        peer_hits = bitcount(self.B[d] & PEER_MASKS[c])
+        return local_tightness + peer_hits
 
     def first_wave_checks(self, c: int, d: int) -> Tuple[bool, int, int]:
+        target_digit = d
         pred_cell = 0
         pred_unit = 0
         B = self.B
@@ -488,21 +497,21 @@ class SolverState:
         unit_digit_deg = self.unit_digit_deg
         bit_c = BIT[c]
         for t in PEERS[c]:
-            if B[d] & BIT[t]:
+            if B[target_digit] & BIT[t]:
                 deg = cell_deg[t]
                 if deg == 1:
                     return False, 0, 0
                 if deg == 2:
                     pred_cell += 1
                 for unit in CELL_UNITS[t]:
-                    udeg = unit_digit_deg[unit][d]
+                    udeg = unit_digit_deg[unit][target_digit]
                     if udeg == 1:
                         return False, 0, 0
                     if udeg == 2:
                         pred_unit += 1
         for unit in CELL_UNITS[c]:
             for e in DIGITS:
-                if e == d or not (B[e] & bit_c):
+                if e == target_digit or not (B[e] & bit_c):
                     continue
                 udeg = unit_digit_deg[unit][e]
                 if udeg == 1:
@@ -1082,6 +1091,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.puzzle_file
         else ("inline_puzzle" if args.puzzle else "N/A")
     )
+    print(f"Start: *******{script_name} - {dataset_label} ******")
     overall_start = perf_counter()
 
     puzzle_runs: List[Dict[str, Any]] = [
@@ -1119,6 +1129,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
 
     min_time = median_time = mean_time = max_time = 0.0
+    aggregate_summary = None
+    aggregate_summary_us = None
     if run_records:
         times = [
             rec["time_ms"] for rec in run_records if isinstance(rec.get("time_ms"), (int, float))
@@ -1128,11 +1140,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             median_time = median(times)
             mean_time = mean(times)
             max_time = max(times)
-            print(
-                "\nAggregate timing (ms): "
-                f"min {min_time:.2f} | median {median_time:.2f} | mean {mean_time:.2f} | max {max_time:.2f}"
+            aggregate_summary = (
+                "Aggregate timing (ms): "
+                f"min {min_time:.2f} | median {median_time:.2f} | "
+                f"mean {mean_time:.2f} | max {max_time:.2f}"
             )
-            print(
+            aggregate_summary_us = (
                 "Aggregate timing (\u00B5s): "
                 f"min {format_us(min_time)} | median {format_us(median_time)} | "
                 f"mean {format_us(mean_time)} | max {format_us(max_time)}"
@@ -1172,10 +1185,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     run_type = "timing" if args.timing_reps > 1 else "solve"
     total_time_ms = total_runtime_s * 1000.0
+    export_csv_path: Optional[Path] = None
+    export_meta_path: Optional[Path] = None
     if args.export_csv:
-        _export_results_csv(args.export_csv, run_records)
-        print(f"Per-puzzle stats exported to {args.export_csv}")
+        export_csv_path = args.export_csv
+        _export_results_csv(export_csv_path, run_records)
     if args.export_meta:
+        export_meta_path = args.export_meta
         meta_payload = {
             "script": script_name,
             "command": command_line,
@@ -1192,9 +1208,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "max_ms": max_time,
             "total_runtime_ms": total_time_ms,
         }
-        args.export_meta.parent.mkdir(parents=True, exist_ok=True)
-        args.export_meta.write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")
-        print(f"Metadata written to {args.export_meta}")
+        export_meta_path.parent.mkdir(parents=True, exist_ok=True)
+        export_meta_path.write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")
 
     html_report_path: Optional[Path] = None
     recorded_run_id: Optional[int] = None
@@ -1223,12 +1238,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 total_time_ms=total_time_ms,
             )
             db.update_html_report(recorded_run_id, html_report_path)
+    if recorded_run_id is not None:
+        if export_csv_path:
+            new_csv = _with_run_id(export_csv_path, recorded_run_id)
+            export_csv_path.rename(new_csv)
+            export_csv_path = new_csv
+        if export_meta_path:
+            new_meta = _with_run_id(export_meta_path, recorded_run_id)
+            export_meta_path.rename(new_meta)
+            export_meta_path = new_meta
+        if html_report_path:
+            new_html = _with_run_id(html_report_path, recorded_run_id)
+            html_report_path.rename(new_html)
+            html_report_path = new_html
+    if export_csv_path:
+        print(f"Per-puzzle stats exported to {export_csv_path}")
+    if export_meta_path:
+        print(f"Metadata written to {export_meta_path}")
     if html_report_path:
         print(f"\nHTML report written to {html_report_path}")
     if recorded_run_id is not None:
         print(f"Run recorded in {args.results_db} (run_id={recorded_run_id}).")
+    if aggregate_summary:
+        print(f"\n{aggregate_summary}")
+    if aggregate_summary_us:
+        print(aggregate_summary_us)
     if exit_code != 0:
         print("*** Run finished with failures. Check details above. ***", file=sys.stderr)
+    solved_pct_final = (solved_count / len(run_records) * 100.0) if run_records else 0.0
+    puzzles_per_sec = (len(run_records) / total_runtime_s) if total_runtime_s > 0 else 0.0
+    sec_per_puzzle = (
+        (total_runtime_s / len(run_records)) if run_records and total_runtime_s > 0 else 0.0
+    )
+    print(
+        f"End: ***************{script_name} - {dataset_label}. "
+        f"{solved_pct_final:.1f}% solved | {puzzles_per_sec:.2f} puzzles/s - "
+        f"Total Time - {total_runtime_s:.2f} s Sec/puzzle: {sec_per_puzzle:.4f} ******"
+    )
 
     return exit_code
 

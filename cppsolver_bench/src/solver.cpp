@@ -20,7 +20,7 @@ inline double wall_ms(SteadyClock::time_point start, SteadyClock::time_point end
 }
 } // namespace
 
-SudokuSolver::SudokuSolver(){
+SudokuSolver::SudokuSolver(const SolverConfig& cfg) : config_(cfg) {
     static bool geom_inited = false;
     if(!geom_inited){
         geom::init();
@@ -55,7 +55,11 @@ bool SudokuSolver::solve(const std::string& puzzle, SolverTimings* timings){
 
     auto search_wall_start = SteadyClock::now();
     double search_cpu_start = cpu_time_seconds();
-    ok = dfs(S_);
+    if(config_.dual.enabled){
+        ok = dfs_dual(S_, config_);
+    }else{
+        ok = dfs_single(S_, config_);
+    }
     auto search_wall_end = SteadyClock::now();
     double search_cpu_end = cpu_time_seconds();
     if(timings){

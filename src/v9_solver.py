@@ -1,11 +1,18 @@
-"""V9 bitboard solver skeleton: phases 0-2 (S0 build + HS/NS + optional pairs)."""
+"""V9 bitboard solver skeleton: phases 0-5 (S0..policy + macro bridge)."""
 from __future__ import annotations
 
 import argparse
+import random
+import math
+import shlex
+import sys
 from pathlib import Path
 from time import perf_counter
 from dataclasses import dataclass
-from typing import List
+from statistics import mean, median
+from typing import List, Optional
+
+from solver_db import SolverDatabase
 
 CELLS = range(81)
 DIGITS = range(9)
@@ -29,14 +36,19 @@ UNIT_MASKS = [sum(BIT81[c] for c in unit) for unit in UNIT_CELLS]
 PEERS_MASK = []
 for c in CELLS:
     mask = 0
-    mask |= sum(BIT81[p] for p in ROWS[ROW_OF[c]])
-    mask |= sum(BIT81[p] for p in COLS[COL_OF[c]])
-    mask |= sum(BIT81[p] for p in BOXES[BOX_OF[c]])
+    for p in ROWS[ROW_OF[c]]:
+        mask |= BIT81[p]
+    for p in COLS[COL_OF[c]]:
+        mask |= BIT81[p]
+    for p in BOXES[BOX_OF[c]]:
+        mask |= BIT81[p]
     mask &= ~BIT81[c]
     PEERS_MASK.append(mask)
 
 STATUS_RANK = {"contradiction": 0, "solved": 1, "neutral": 2}
 
+
+DEBUG = False
 
 try:  # Python 3.11+
     int_bit_count = int.bit_count  # type: ignore[attr-defined]
@@ -52,6 +64,23 @@ def _state_hash(B: List[int]) -> int:
     return hash(tuple(B))
 
 
+def _percentile(values: List[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    if pct <= 0:
+        return min(values)
+    if pct >= 1:
+        return max(values)
+    ordered = sorted(values)
+    pos = pct * (len(ordered) - 1)
+    lower = math.floor(pos)
+    upper = math.ceil(pos)
+    if lower == upper:
+        return ordered[lower]
+    frac = pos - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * frac
+
+
 def _iter_bits(mask: int):
     while mask:
         bit = mask & -mask
@@ -63,6 +92,9 @@ def _iter_bits(mask: int):
 class Rules:
     use_np: bool = False
     use_hp: bool = False
+    use_locks: bool = True
+    hp_mode: str = "off"
+    locks_mode: str = "all"
 
 
 @dataclass
@@ -71,6 +103,7 @@ class MacroConfig:
     targets: int = 0
     soft_passes: int = 0
     budget_ms: float = 0.0
+    max_depth: int = 0
 
 
 @dataclass
@@ -79,6 +112,7 @@ class SoftResult:
     digit: int
     status: str
     ns_gain: int
+    cand_before: int
     cand_after: int
     passes: int
 
@@ -91,6 +125,8 @@ class MacroPlan:
 
 
 def debug_assert_state(B: List[int]) -> None:
+    if not DEBUG:
+        return
     open_mask = 0
     for d in DIGITS:
         open_mask |= B[d]
@@ -313,14 +349,14 @@ def soft_simulate_guess(
     base_cand = total_candidates(B)
     branch = clone_state(B)
     if not place_structural(branch, cell, digit):
-        return SoftResult(cell, digit, "contradiction", 0, base_cand, 0)
+        return SoftResult(cell, digit, "contradiction", 0, base_cand, base_cand, 0)
     ok, passes = _close_all(branch, rules, max_passes)
     if not ok:
-        return SoftResult(cell, digit, "contradiction", 0, base_cand, passes)
+        return SoftResult(cell, digit, "contradiction", 0, base_cand, base_cand, passes)
     ns_gain = max(0, count_solved(branch) - base_solved)
     cand_after = total_candidates(branch)
     status = "solved" if is_solved(branch) else "neutral"
-    return SoftResult(cell, digit, status, ns_gain, cand_after, passes)
+    return SoftResult(cell, digit, status, ns_gain, base_cand, cand_after, passes)
 
 
 def gather_macro_candidates(B: List[int], limit: int) -> List[tuple[int, int]]:
@@ -359,12 +395,28 @@ def gather_macro_candidates(B: List[int], limit: int) -> List[tuple[int, int]]:
     return moves
 
 
+def _should_commit(res: SoftResult, gain_min: int, ratio: float) -> bool:
+    if res.status == "contradiction":
+        return False
+    if res.status == "solved":
+        return True
+    if res.ns_gain >= gain_min:
+        return True
+    if res.cand_before > 0 and res.cand_after <= ratio * res.cand_before:
+        return True
+    return False
+
+
 def build_macro_plan(B: List[int], rules: Rules, cfg: MacroConfig) -> MacroPlan:
     stats: dict[str, object] = {
         "macro_mode": cfg.mode,
         "macro_sims": 0,
         "macro_bail_reason": "none",
         "macro_build_time_ms": 0.0,
+        "macro_commits": 0,
+        "macro_commit_type": "none",
+        "macro_pairs_ranked": 0,
+        "macro_pairs_validated": 0,
     }
     if cfg.mode == "off" or cfg.targets <= 0 or cfg.soft_passes <= 0:
         stats["macro_bail_reason"] = "off" if cfg.mode == "off" else "disabled"
@@ -404,12 +456,63 @@ def build_macro_plan(B: List[int], rules: Rules, cfg: MacroConfig) -> MacroPlan:
 
     results.sort(key=macro_key)
     per_cell_order: dict[int, List[int]] = {}
-    if cfg.mode == "order":
+    if cfg.mode in {"order", "commit1", "commit2"}:
         for res in results:
             bucket = per_cell_order.setdefault(res.cell, [])
             if res.digit not in bucket:
                 bucket.append(res.digit)
     return MacroPlan(per_cell_order, results, stats)
+
+
+def apply_macro_commits(
+    root: List[int],
+    rules: Rules,
+    cfg: MacroConfig,
+    plan: MacroPlan,
+) -> bool:
+    stats = plan.stats
+    stats["macro_commits"] = stats.get("macro_commits", 0)
+    stats["macro_commit_type"] = stats.get("macro_commit_type", "none")
+    if cfg.mode not in {"commit1", "commit2"}:
+        return False
+    commit_limits = 1 if cfg.mode == "commit1" else 2
+    thresholds = [
+        (8, 0.80),   # first commit threshold
+        (12, 0.65),  # second commit threshold
+    ]
+    used: set[int] = set()
+    commits = 0
+    for step in range(commit_limits):
+        gain_min, ratio = thresholds[min(step, len(thresholds) - 1)]
+        candidate_idx = None
+        candidate = None
+        for idx, res in enumerate(plan.results):
+            if idx in used:
+                continue
+            if not _should_commit(res, gain_min, ratio):
+                continue
+            if not has_candidate(root, res.cell, res.digit):
+                used.add(idx)
+                continue
+            candidate_idx = idx
+            candidate = res
+            break
+        if candidate is None:
+            break
+        trial = clone_state(root)
+        if not place_structural(trial, candidate.cell, candidate.digit):
+            used.add(candidate_idx)
+            continue
+        if not close_all(trial, rules):
+            used.add(candidate_idx)
+            continue
+        for d in DIGITS:
+            root[d] = trial[d]
+        used.add(candidate_idx)
+        commits += 1
+    stats["macro_commits"] = commits
+    stats["macro_commit_type"] = cfg.mode if commits else "none"
+    return commits > 0
 
 
 def try_guess(B: List[int], cell: int, digit: int, rules: Rules) -> List[int] | None:
@@ -481,16 +584,24 @@ def board_to_string(B: List[int]) -> str:
     return "\n".join(rows)
 
 
-def load_puzzle(path: Path) -> str:
-    """Return the first puzzle (81 chars) ignoring comments/blank lines."""
-    for raw in path.read_text().splitlines():
-        stripped = raw.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        digits = [ch for ch in stripped if ch in "0123456789."]
-        if len(digits) >= 81:
-            return "".join(digits[:81])
-    raise ValueError("Puzzle must contain at least 81 characters")
+def _extract_puzzle(text: str) -> str:
+    digits = [ch for ch in text if ch in "0123456789."]
+    if len(digits) < 81:
+        raise ValueError("Puzzle input must contain at least 81 characters.")
+    return "".join(digits[:81])
+
+
+def _load_puzzles(puzzle: Optional[str], puzzle_file: Optional[Path]) -> List[str]:
+    puzzles: List[str] = []
+    if puzzle:
+        puzzles.append(_extract_puzzle(puzzle))
+    if puzzle_file:
+        for raw in puzzle_file.read_text().splitlines():
+            stripped = raw.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            puzzles.append(_extract_puzzle(stripped))
+    return puzzles
 
 
 def build_S0(puzzle: str, rules: Rules) -> List[int]:
@@ -509,45 +620,288 @@ def build_S0(puzzle: str, rules: Rules) -> List[int]:
     return B
 
 
+def solve_once(puzzle: str, rules: Rules, macro_cfg: MacroConfig) -> dict:
+    s0_start = perf_counter()
+    s0 = build_S0(puzzle, rules)
+    s0_time = perf_counter() - s0_start
+    macro_plan = build_macro_plan(s0, rules, macro_cfg)
+    root_state = clone_state(s0)
+    committed = apply_macro_commits(root_state, rules, macro_cfg, macro_plan)
+    macro_stats = dict(macro_plan.stats)
+    plan_for_dfs = macro_plan
+    follow_stats = None
+    if committed and macro_cfg.mode in {"commit1", "commit2"}:
+        order_cfg = MacroConfig(
+            mode="order",
+            targets=macro_cfg.targets,
+            soft_passes=macro_cfg.soft_passes,
+            budget_ms=macro_cfg.budget_ms,
+        )
+        follow_plan = build_macro_plan(root_state, rules, order_cfg)
+        follow_stats = dict(follow_plan.stats)
+        macro_stats["macro_followup_sims"] = follow_stats.get("macro_sims", 0)
+        macro_stats["macro_followup_time_ms"] = follow_stats.get("macro_build_time_ms", 0.0)
+        macro_stats["macro_followup_bail"] = follow_stats.get("macro_bail_reason", "none")
+        plan_for_dfs = follow_plan
+    solve_start = perf_counter()
+    stats: dict[str, int] = {}
+    solution = dfs(root_state, rules, stats, plan_for_dfs)
+    solve_time = perf_counter() - solve_start
+    return {
+        "success": solution is not None,
+        "nodes": stats.get("nodes", 0),
+        "s0_time_ms": s0_time * 1000.0,
+        "solve_time_ms": solve_time * 1000.0,
+        "macro_stats": macro_stats,
+        "macro_follow_stats": follow_stats,
+        "board": board_to_string(solution) if solution is not None else None,
+    }
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="V9 S0 builder")
-    parser.add_argument("--puzzle-file", type=Path, required=True)
-    parser.add_argument("--use-np", action="store_true", help="Enable naked pairs in closure")
-    parser.add_argument("--use-hp", action="store_true", help="Enable hidden pairs in closure")
-    parser.add_argument("--macro-bridge", choices=["off", "order"], default="off")
+    parser = argparse.ArgumentParser(description="V9 solver with macro bridge")
+    parser.add_argument("--puzzle", help="Single puzzle string (81 chars).")
+    parser.add_argument("--puzzle-file", type=Path, help="Path to a text file with puzzles.")
+    parser.add_argument(
+        "--rules-profile",
+        choices=["basic", "pairs", "full"],
+        default="basic",
+        help="Rule profile: basic(HS/NS), pairs(+NP), full(+NP+HP)",
+    )
+    parser.add_argument("--np", dest="np_override", action="store_const", const=True, help="Force enable naked pairs")
+    parser.add_argument("--no-np", dest="np_override", action="store_const", const=False, help="Force disable naked pairs")
+    parser.add_argument("--hp", dest="hp_override", action="store_const", const=True, help="Force enable hidden pairs")
+    parser.add_argument("--no-hp", dest="hp_override", action="store_const", const=False, help="Force disable hidden pairs")
+    parser.add_argument(
+        "--macro-bridge",
+        choices=["off", "order", "commit1", "commit2"],
+        default="off",
+    )
     parser.add_argument("--macro-targets", type=int, default=0)
     parser.add_argument("--macro-soft-passes", type=int, default=32)
     parser.add_argument("--macro-budget-ms", type=float, default=5.0)
+    parser.add_argument("--start", type=int, default=0, help="0-based index of first puzzle to process.")
+    parser.add_argument("--count", type=int, help="Maximum number of puzzles to process.")
+    parser.add_argument("--runs", type=int, default=1, help="Number of attempts per puzzle.")
+    parser.add_argument(
+        "--timing-reps",
+        type=int,
+        default=1,
+        help="Dataset repetitions (shuffles puzzles each rep).",
+    )
+    parser.add_argument("--shuffle-seed", type=int, default=1337, help="Seed used when timing reps > 1.")
+    parser.add_argument("--quiet", action="store_true", help="Suppress per-run logs.")
+    parser.add_argument(
+        "--locks-mode",
+        choices=["off", "l1", "all"],
+        default="all",
+        help="Locks policy: disable, root-only, or all depths.",
+    )
+    parser.add_argument(
+        "--hp-mode",
+        choices=["off", "l1", "all"],
+        default="off",
+        help="Hidden-pair policy: disable, root-only, or all depths.",
+    )
+    parser.add_argument(
+        "--macro-depth",
+        type=int,
+        default=0,
+        help="Maximum DFS depth at which the macro bridge may run.",
+    )
+    parser.add_argument(
+        "--results-db",
+        type=Path,
+        default=Path("solver_results.sqlite"),
+        help="SQLite database path for recording run metadata.",
+    )
+    parser.set_defaults(np_override=None, hp_override=None)
     args = parser.parse_args()
-    puzzle = load_puzzle(args.puzzle_file)
-    rules = Rules(use_np=args.use_np, use_hp=args.use_hp)
+
+    try:
+        puzzles = _load_puzzles(args.puzzle, args.puzzle_file)
+    except ValueError as exc:
+        parser.error(str(exc))
+        return
+    if not puzzles:
+        parser.error("No puzzles supplied.")
+        return
+    if args.start < 0:
+        parser.error("--start must be non-negative.")
+    if args.count is not None and args.count <= 0:
+        parser.error("--count must be positive when provided.")
+    if args.runs <= 0:
+        parser.error("--runs must be positive.")
+    if args.timing_reps <= 0:
+        parser.error("--timing-reps must be positive.")
+
+    script_name = Path(__file__).name
+    dataset_label = (
+        str(args.puzzle_file)
+        if args.puzzle_file
+        else ("inline_puzzle" if args.puzzle else "N/A")
+    )
+    use_np = False
+    use_hp = False
+    if args.rules_profile in {"pairs", "full"}:
+        use_np = True
+    if args.rules_profile == "full":
+        use_hp = True
+    if args.np_override is not None:
+        use_np = args.np_override
+    if args.hp_override is not None:
+        use_hp = args.hp_override
+    use_locks = args.locks_mode != "off"
+    rules = Rules(
+        use_np=use_np,
+        use_hp=use_hp,
+        use_locks=use_locks,
+        hp_mode=args.hp_mode,
+        locks_mode=args.locks_mode,
+    )
+
     macro_cfg = MacroConfig(
         mode=args.macro_bridge,
         targets=args.macro_targets,
         soft_passes=args.macro_soft_passes,
         budget_ms=args.macro_budget_ms,
+        max_depth=max(0, args.macro_depth),
     )
-    s0_start = perf_counter()
-    s0 = build_S0(puzzle, rules)
-    s0_time = perf_counter() - s0_start
-    print(f"Built S0 in {s0_time*1000:.2f} ms, hash={_state_hash(s0)}")
-    macro_plan = build_macro_plan(s0, rules, macro_cfg)
+
+    selected = puzzles[args.start :]
+    if args.count is not None:
+        selected = selected[: args.count]
+    if not selected:
+        parser.error("Requested puzzle range produced no entries.")
+    num_selected = len(selected)
+    auto_show_board = (
+        not args.quiet and num_selected == 1 and args.runs == 1 and args.timing_reps == 1
+    )
+
+    total_runs = 0
+    solved_runs = 0
+    sum_nodes = 0
+    sum_s0_ms = 0.0
+    sum_solve_ms = 0.0
+    sum_solver_ms = 0.0
+    per_run_totals: List[float] = []
+    db_records: List[dict] = []
+    overall_start = perf_counter()
+    for rep in range(args.timing_reps):
+        order = list(enumerate(selected, start=args.start))
+        if args.timing_reps > 1:
+            rnd = random.Random(args.shuffle_seed + rep)
+            rnd.shuffle(order)
+        for puzzle_index, puzzle in order:
+            for run in range(args.runs):
+                total_runs += 1
+                result = solve_once(puzzle, rules, macro_cfg)
+                if result["success"]:
+                    solved_runs += 1
+                sum_nodes += result["nodes"]
+                sum_s0_ms += result["s0_time_ms"]
+                sum_solve_ms += result["solve_time_ms"]
+                per_run_total_ms = result["s0_time_ms"] + result["solve_time_ms"]
+                sum_solver_ms += per_run_total_ms
+                per_run_totals.append(per_run_total_ms)
+                db_records.append(
+                    {
+                        "index": puzzle_index,
+                        "status": "OK" if result["success"] else "FAIL",
+                        "time_ms": per_run_total_ms,
+                        "stats": {"nodes": result["nodes"]},
+                        "puzzle": puzzle,
+                        "solution": result["board"],
+                        "verified": result["success"],
+                        "error": None if result["success"] else "unsolved",
+                        "rep_count": 1,
+                        "solved_runs": 1 if result["success"] else 0,
+                        "median_ms": per_run_total_ms,
+                        "min_ms": per_run_total_ms,
+                        "max_ms": per_run_total_ms,
+                    }
+                )
+                if not args.quiet:
+                    prefix = f"[p{puzzle_index} rep {rep + 1} run {run + 1}]"
+                    status = "OK" if result["success"] else "FAIL"
+                    macro_stats = result["macro_stats"]
+                    macro_line = (
+                        f"mode={macro_stats.get('macro_mode')} "
+                        f"sims={macro_stats.get('macro_sims', 0)} "
+                        f"time_ms={macro_stats.get('macro_build_time_ms', 0):.2f} "
+                        f"bail={macro_stats.get('macro_bail_reason')} "
+                        f"commits={macro_stats.get('macro_commits', 0)} "
+                        f"commit_type={macro_stats.get('macro_commit_type')} "
+                        f"pairs_ranked={macro_stats.get('macro_pairs_ranked', 0)} "
+                        f"pairs_validated={macro_stats.get('macro_pairs_validated', 0)}"
+                    )
+                    print(
+                        f"{prefix} {status} "
+                        f"s0={result['s0_time_ms']:.2f} ms "
+                        f"solve={result['solve_time_ms']:.2f} ms "
+                        f"nodes={result['nodes']} "
+                        f"total={per_run_total_ms:.2f} ms "
+                        f"macro[{macro_line}]"
+                    )
+                    follow = result["macro_follow_stats"]
+                    if follow:
+                        print(
+                            f"    follow-up sims={follow.get('macro_sims', 0)} "
+                            f"time_ms={follow.get('macro_build_time_ms', 0):.2f} "
+                            f"bail={follow.get('macro_bail_reason')}"
+                        )
+                    if (
+                        auto_show_board
+                        and result["success"]
+                        and rep == 0
+                        and run == 0
+                        and result["board"]
+                    ):
+                        print(result["board"])
+
+    total_elapsed = perf_counter() - overall_start
+    if total_runs == 0:
+        print("No runs executed.")
+        return
+    solved_pct = (solved_runs / total_runs) * 100.0
+    avg_s0 = sum_s0_ms / total_runs
+    avg_solve = sum_solve_ms / total_runs
+    avg_nodes = sum_nodes / total_runs
+    avg_solver = sum_solver_ms / total_runs
+    median_solver = median(per_run_totals) if per_run_totals else 0.0
+    min_solver = min(per_run_totals) if per_run_totals else 0.0
+    max_solver = max(per_run_totals) if per_run_totals else 0.0
+    p90_solver = _percentile(per_run_totals, 0.90)
+    p95_solver = _percentile(per_run_totals, 0.95)
+    print(f"Solved {solved_runs}/{total_runs} runs ({solved_pct:.1f}%).")
     print(
-        "Macro stats:",
-        f"mode={macro_cfg.mode}",
-        f"sims={macro_plan.stats.get('macro_sims', 0)}",
-        f"time_ms={macro_plan.stats.get('macro_build_time_ms', 0):.2f}",
-        f"bail={macro_plan.stats.get('macro_bail_reason')}",
+        "Solver stats (ms/run): "
+        f"mean {avg_solver:.2f} | median {median_solver:.2f} | "
+        f"p90 {p90_solver:.2f} | p95 {p95_solver:.2f} | "
+        f"min {min_solver:.2f} | max {max_solver:.2f}"
     )
-    solve_start = perf_counter()
-    stats: dict[str, int] = {}
-    solution = dfs(clone_state(s0), rules, stats, macro_plan)
-    solve_time = perf_counter() - solve_start
-    if solution is None:
-        print(f"No solution found (nodes={stats.get('nodes', 0)}, solve_time={solve_time*1000:.2f} ms)")
-    else:
-        print(f"Solved in {solve_time*1000:.2f} ms, nodes={stats.get('nodes', 0)}")
-        print(board_to_string(solution))
+    print(
+        f"Totals: solver {sum_solver_ms/1000.0:.2f} s | "
+        f"avg s0={avg_s0:.2f} ms | avg solve={avg_solve:.2f} ms | "
+        f"avg nodes={avg_nodes:.1f} | wall={(total_elapsed * 1000):.2f} ms"
+    )
+
+    if db_records:
+        run_type = "timing" if args.timing_reps > 1 else "solve"
+        command_line = shlex.join(sys.argv)
+        with SolverDatabase(args.results_db) as db:
+            recorded = db.record_run(
+                script_name=script_name,
+                command_line=command_line,
+                dataset=dataset_label,
+                args=args,
+                run_records=db_records,
+                html_report=None,
+                run_type=run_type,
+                timing_reps=args.timing_reps,
+                total_time_ms=sum_solver_ms,
+            )
+        print(f"Run recorded in {args.results_db} (run_id={recorded.run_id}).")
 
 
 if __name__ == "__main__":

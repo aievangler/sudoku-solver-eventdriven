@@ -187,6 +187,7 @@ static bool process_lock_event(SolverState& S, int b, int d){
 
 bool propagate(SolverState& S){
     // Drain queues to fixpoint
+    S.last_prop_placements = 0;
     int c;
     int u,d, b;
     while(true){
@@ -197,6 +198,7 @@ bool propagate(SolverState& S){
             // guard: do not double-place
             if(!S.cell_value[c]){
                 if(!place_digit(S, c, dig)) return false;
+                ++S.last_prop_placements;
                 progressed=true;
             }
         }
@@ -208,6 +210,7 @@ bool propagate(SolverState& S){
             if(geom::any(mask)){
                 int cell = geom::ctz(mask);
                 if(!place_digit(S, cell, d)) return false;
+                ++S.last_prop_placements;
                 progressed=true;
             }
         }

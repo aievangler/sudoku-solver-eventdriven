@@ -13,12 +13,14 @@ struct SolverTimings {
 
 class SudokuSolver {
 public:
-    SudokuSolver();
+    explicit SudokuSolver(const SolverConfig& cfg = SolverConfig());
     bool solve(const std::string& puzzle, SolverTimings* timings = nullptr);
     std::string solution_string() const;
     const SolverState& state() const { return S_; }
+    void set_config(const SolverConfig& cfg){ config_ = cfg; }
 
 private:
     SolverState S_;
     Trail trail_;
+    SolverConfig config_{};
 };

@@ -78,6 +78,7 @@ int main(int argc, char** argv){
     std::cin.tie(nullptr);
 
     bool timings_enabled = false;
+    bool dual_enabled = false;
     bool benchmark_mode = false;
     std::string file_path;
     std::string puzzle_arg;
@@ -94,18 +95,24 @@ int main(int argc, char** argv){
             timings_enabled = true;
         }else if(arg == "--benchmark"){
             benchmark_mode = true;
+        }else if(arg == "--dual-activation"){
+            dual_enabled = true;
         }else{
             puzzle_arg = arg;
         }
     }
 
+    SolverConfig cfg;
+    cfg.dual.enabled = dual_enabled;
+
     if(!file_path.empty()){
+
         std::ifstream in(file_path);
         if(!in){
             std::cerr << "Failed to open " << file_path << "\n";
             return 1;
         }
-        SudokuSolver solver;
+        SudokuSolver solver(cfg);
         bool all_ok = true;
         std::string line;
         if(benchmark_mode){
@@ -147,7 +154,7 @@ int main(int argc, char** argv){
         return 1;
     }
 
-    SudokuSolver solver;
+    SudokuSolver solver(cfg);
     std::string puzzle =
         (!puzzle_arg.empty() ? puzzle_arg :
          "53..7...."

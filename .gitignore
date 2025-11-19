@@ -50,3 +50,14 @@ sudoku_solver_v2_20251106.py
 v2_sudoku_81bit.py
 v3_sudoku_81bit.py
 v4_sudoku_81bit.py
+fresh_solutions.txt
+new_solutions.txt
+solutions.txt
+testoutput.txt
+timings_full.log
+timings.log
+Results/solverREsults_20251118_withCPP_V7_V10
+src/v8_sudoku_81bit.py
+src/v9_core.py
+src/v9_solver.py
+src/v7_sudoku_81bit.py

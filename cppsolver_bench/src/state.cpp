@@ -17,6 +17,7 @@ void SolverState::reset(){
     enq_l4.fill(0); enq_l1.fill(0); enq_lock.fill(0);
     contradiction = false;
     scarcity.fill(0);
+    last_prop_placements = 0;
 }
 
 bool SolverState::is_solved() const{

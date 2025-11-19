@@ -37,6 +37,8 @@ struct SolverState {
     // Scarcity cache (cells available per digit)
     std::array<int, 9> scarcity{};
 
+    int last_prop_placements = 0;
+
     Trail* trail = nullptr; // set by owner
 
     void reset();
