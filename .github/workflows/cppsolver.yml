@@ -1,0 +1,30 @@
+name: C++ Solver CI
+
+on:
+  push:
+    branches: [ wip ]
+  pull_request:
+    branches: [ wip ]
+
+jobs:
+  build-and-benchmark:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build cppsolver
+        run: |
+          cd cppsolver
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-march=native -flto"
+          cmake --build build -j
+
+      - name: Build cppsolver_bench
+        run: |
+          cd cppsolver_bench
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-march=native -flto"
+          cmake --build build -j
+
+      - name: Run benchmark on sample dataset
+        run: |
+          head -n 20 testFileSets/hard95_puzzles > /tmp/sample.txt
+          ./cppsolver_bench/build/cppsolver --file /tmp/sample.txt --benchmark
