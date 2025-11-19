@@ -233,6 +233,50 @@ python3 benchmarks/bench_runner.py --file testFileSets/hard95_puzzles --count 10
 
 Handy for CI or one-line comparisons with Tdoku (outputs solved count, total seconds, and ms/puzzle).
 
+## C++ solver builds & harness integration
+
+Two ready-to-build C++ ports live under `cppsolver/` (solutions + timings) and `cppsolver_bench/` (adds `--benchmark` mode). Build them with:
+
+```
+cd cppsolver
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-march=native -flto"
+cmake --build build -j
+
+cd ../cppsolver_bench
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-march=native -flto"
+cmake --build build -j
+```
+
+Usage examples:
+
+```
+# normal solver with timings/solutions
+./cppsolver/build/cppsolver --file testFileSets/puzzles2_17_clue --timings
+
+# benchmark mode: no per-puzzle output, prints summary
+./cppsolver_bench/build/cppsolver --file testFileSets/puzzles2_17_clue --benchmark
+```
+
+The Python harness supports the C++ port via `planrun.py --engine cpp`, and `run_v7_v10.sh` now runs the cpp solver (benchmark mode) alongside the V7/V10 presets:
+
+```
+python3 planrun.py --engine cpp --puzzle-file testFileSets/puzzles2_17_clue
+python3 planrun.py --engine cpp --puzzle-file testFileSets/puzzles2_17_clue --cpp-mode benchmark
+
+RUNS=1 REPS=1 bash run_v7_v10.sh testFileSets/puzzles2_17_clue
+```
+
+Make sure the binaries are built before invoking these scripts.
+
+### Expected timings (macOS M-series)
+
+| Dataset | Mode | Command | Wall time |
+|---------|------|---------|-----------|
+| 17-clue (49,158 puzzles) | normal | `./cppsolver/build/cppsolver --file testFileSets/puzzles2_17_clue --timings` | ~0.58 s |
+| 17-clue (49,158 puzzles) | benchmark | `./cppsolver_bench/build/cppsolver --file testFileSets/puzzles2_17_clue --benchmark` | ~0.55 s |
+
+These numbers come from Apple Silicon Release builds with `-O3 -march=native -flto` and provide a reference to verify your local runs.
+
 ## Repository layout
 
 ```
